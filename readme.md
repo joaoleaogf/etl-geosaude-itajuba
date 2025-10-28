@@ -12,6 +12,34 @@ O sistema realiza:
 
 O ETL serve como base para as análises de distribuição espacial de atendimentos, correlações demográficas e identificação de hotspots e coldspots de saúde pública no município de  **Itajubá-MG** .
 
+## Execução do ETL em duas etapas
+
+O pipeline pode ser executado em duas fases distintas:
+
+1. **Stage 1 – Normalização e arquivos para PostGIS**
+
+   ```bash
+   npx ts-node script.ts stage1 ./TABLE_EXPORT_DATA.json ./output
+   ```
+
+   Gera `patients.json`, `attendances.json` e `postgis_ready.csv`, consolidados para importação no PostGIS.
+
+2. **Stage 2 – Consolidação de endereços e coordenadas**
+
+   ```bash
+   npx ts-node script.ts stage2 ./output/patients.json ./output
+   ```
+
+   Deduplica endereços, agrega número de ocorrências e consolida latitude/longitude (quando disponível), podendo acionar geocodificação com `--geocode`.
+
+Para executar as duas etapas em sequência basta omitir o subcomando:
+
+```bash
+npx ts-node script.ts ./TABLE_EXPORT_DATA.json ./output --geocode
+```
+
+Opcionalmente utilize `--patients=/caminho/personalizado.json` para informar uma origem específica dos dados de pacientes na segunda etapa.
+
 ## Perguntas Focadas na Distribuição e Demografia Espacial
 
 1. **Qual é o padrão de distribuição espacial (hotspots e coldspots) da frequência total de atendimentos hospitalares em Itajubá?**
