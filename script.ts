@@ -87,9 +87,12 @@ class Logger {
 interface RawPatientData {
   nr_atendimento?: number;
   ds_paciente?: string;
+  nm_paciente?: string;
   nr_anos?: number | string;
   dt_nascimento?: string;
   ds_genero?: string;
+  ds_sexo?: string;
+  ie_sexo?: string;
   estado_civil?: string;
   ie_grau_instrucao?: string;
   ds_proc_principal?: string;
@@ -149,6 +152,157 @@ interface ETLOptions {
 
 type Coordinates = { latitude: number; longitude: number };
 
+async function isTableExportJson(filePath: string): Promise<boolean> {
+  try {
+    const fd = await fsp.open(filePath, "r");
+    const buf = Buffer.alloc(4096);
+    const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
+    await fd.close();
+    const sample = buf.slice(0, bytesRead).toString("utf-8");
+    const sanitized = sample.replace(/\s+/g, "");
+    return sanitized.startsWith('{"items":[');
+  } catch {
+    return false;
+  }
+}
+
+function createProgressTracker(
+  rs: fs.ReadStream,
+  totalSize: number,
+  logger: Logger,
+) {
+  let readBytes = 0;
+  let lastLog = Date.now();
+  const t0 = Date.now();
+  const PROGRESS_INTERVAL_MS = 2000;
+
+  rs.on("data", (chunk: any) => {
+    readBytes += Buffer.byteLength(chunk, "utf-8");
+    const now = Date.now();
+    if (now - lastLog >= PROGRESS_INTERVAL_MS) {
+      lastLog = now;
+      if (totalSize > 0) {
+        const pct = ((readBytes / totalSize) * 100).toFixed(1);
+        const dt = (now - t0) / 1000;
+        const mb = readBytes / (1024 * 1024);
+        const speed = dt > 0 ? (mb / dt).toFixed(2) : "0.00";
+        const remaining = totalSize - readBytes;
+        const etaSec = Number(speed) > 0 ? remaining / (1024 * 1024) / Number(speed) : 0;
+        const eta = etaSec > 0 ? `${Math.max(0, Math.round(etaSec))}s` : "—";
+        logger.progress(
+          `${pct}% | ${mb.toFixed(1)}MB/${(totalSize / (1024 * 1024)).toFixed(1)}MB @ ${speed} MB/s | ETA ${eta}`,
+        );
+      } else {
+        const mb = readBytes / (1024 * 1024);
+        logger.progress(`${mb.toFixed(1)}MB lidos (tamanho total desconhecido)`);
+      }
+    }
+  });
+
+  return {
+    finalize() {
+      if (totalSize > 0) {
+        const mb = readBytes / (1024 * 1024);
+        logger.progress(`100% | ${mb.toFixed(1)}MB/${(totalSize / (1024 * 1024)).toFixed(1)}MB`);
+      }
+    },
+  };
+}
+
+async function streamTableExportRecords(
+  filePath: string,
+  logger: Logger,
+  onRecord: (jsonChunk: string) => Promise<void>,
+  totalSize: number,
+): Promise<{ totalChunks: number; failedChunks: number }> {
+  const rs = fs.createReadStream(filePath, { encoding: "utf-8" });
+  const tracker = createProgressTracker(rs, totalSize, logger);
+
+  let lookback = "";
+  let insideItems = false;
+  let recordBuffer = "";
+  let recordDepth = 0;
+  let recordInString = false;
+  let recordEscape = false;
+
+  let total = 0;
+  let failed = 0;
+
+  const emitRecord = async (raw: string) => {
+    const trimmed = raw.trim();
+    if (!trimmed) return;
+    total += 1;
+    try {
+      await onRecord(trimmed);
+    } catch {
+      failed += 1;
+    }
+  };
+
+  for await (const chunk of rs) {
+    for (let idx = 0; idx < chunk.length; idx += 1) {
+      const ch = chunk[idx];
+
+      if (!insideItems) {
+        lookback += ch;
+        if (lookback.length > 128) {
+          lookback = lookback.slice(-128);
+        }
+        const sanitized = lookback.replace(/\s+/g, "");
+        if (sanitized.endsWith('"items":[')) {
+          insideItems = true;
+          lookback = "";
+        }
+        continue;
+      }
+
+      if (!recordBuffer) {
+        if (ch === ']' && !recordInString && recordDepth === 0) {
+          insideItems = false;
+          continue;
+        }
+        if (ch === ',' || ch === '\n' || ch === '\r' || ch === '\t' || ch === ' ') {
+          continue;
+        }
+      }
+
+      recordBuffer += ch;
+
+      if (recordEscape) {
+        recordEscape = false;
+        continue;
+      }
+      if (ch === '\\') {
+        recordEscape = true;
+        continue;
+      }
+      if (ch === '"') {
+        recordInString = !recordInString;
+        continue;
+      }
+      if (!recordInString) {
+        if (ch === '{') {
+          recordDepth += 1;
+        } else if (ch === '}') {
+          recordDepth = Math.max(0, recordDepth - 1);
+          if (recordDepth === 0) {
+            await emitRecord(recordBuffer);
+            recordBuffer = "";
+          }
+        }
+      }
+    }
+  }
+
+  if (recordBuffer.trim()) {
+    await emitRecord(recordBuffer);
+  }
+
+  tracker.finalize();
+
+  return { totalChunks: total, failedChunks: failed };
+}
+
 function buildFullAddress(address: {
   street: string;
   number: string;
@@ -190,7 +344,7 @@ async function toCleanEntities(
     ? Number(String(row.nr_anos).replace(",", "."))
     : ageFromBirthDate(birth);
 
-  const gender = normalizeGender(row.ds_genero);
+  const gender = normalizeGender(row.ds_genero ?? row.ds_sexo ?? row.ie_sexo);
   const education = fixEducationLevel(row.ie_grau_instrucao);
   const marital = fixMaritalStatus(row.estado_civil);
 
@@ -216,7 +370,7 @@ async function toCleanEntities(
 
   const patient: CleanedPatient = {
     id,
-    nome: normalizeString(row.ds_paciente || ""),
+    nome: normalizeString(row.ds_paciente ?? row.nm_paciente ?? ""),
     birth_date: birth ? birth.toISOString() : null,
     age: Number.isFinite(age as number) ? (age as number) : null,
     gender,
@@ -595,11 +749,16 @@ async function streamRecords(
   logger: Logger,
   onRecord: (jsonChunk: string) => Promise<void>
 ): Promise<{ totalChunks: number; failedChunks: number }> {
-  const rs = fs.createReadStream(filePath, { encoding: "utf-8" });
-  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
-
   const stat = await fsp.stat(filePath).catch(() => null);
   const totalSize = stat?.size ?? 0;
+
+  if (await isTableExportJson(filePath)) {
+    return streamTableExportRecords(filePath, logger, onRecord, totalSize);
+  }
+
+  const rs = fs.createReadStream(filePath, { encoding: "utf-8" });
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
+  const tracker = createProgressTracker(rs, totalSize, logger);
 
   let buf = "";
   let depthCurly = 0;
@@ -610,33 +769,6 @@ async function streamRecords(
 
   let total = 0;
   let failed = 0;
-
-  // progresso por bytes
-  let readBytes = 0;
-  let lastLog = Date.now();
-  const t0 = Date.now();
-  const PROGRESS_INTERVAL_MS = 2000; // 2s
-
-  rs.on("data", (chunk: any) => {
-    readBytes += Buffer.byteLength(chunk, "utf-8");
-    const now = Date.now();
-    if (now - lastLog >= PROGRESS_INTERVAL_MS) {
-      lastLog = now;
-      if (totalSize > 0) {
-        const pct = ((readBytes / totalSize) * 100).toFixed(1);
-        const dt = (now - t0) / 1000;
-        const mb = readBytes / (1024 * 1024);
-        const speed = dt > 0 ? (mb / dt).toFixed(2) : "0.00";
-        const remaining = totalSize - readBytes;
-        const etaSec = Number(speed) > 0 ? remaining / (1024 * 1024) / Number(speed) : 0;
-        const eta = etaSec > 0 ? `${Math.max(0, Math.round(etaSec))}s` : "—";
-        logger.progress(`${pct}% | ${mb.toFixed(1)}MB/${(totalSize / (1024 * 1024)).toFixed(1)}MB @ ${speed} MB/s | ETA ${eta}`);
-      } else {
-        const mb = readBytes / (1024 * 1024);
-        logger.progress(`${mb.toFixed(1)}MB lidos (tamanho total desconhecido)`);
-      }
-    }
-  });
 
   const flushIfComplete = async () => {
     const trimmed = buf.trim();
@@ -716,11 +848,7 @@ async function streamRecords(
   // Flush final (se sobrou algo “fechado”)
   await flushIfComplete();
 
-  // log final de progresso (100%)
-  if (totalSize > 0) {
-    const mb = readBytes / (1024 * 1024);
-    logger.progress(`100% | ${mb.toFixed(1)}MB/${(totalSize / (1024 * 1024)).toFixed(1)}MB`);
-  }
+  tracker.finalize();
 
   return { totalChunks: total, failedChunks: failed };
 }
