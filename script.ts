@@ -274,13 +274,45 @@ function formatCsvValue(value: unknown): string {
   return str;
 }
 
+interface CsvWriterOptions {
+  append?: boolean;
+  flushEvery?: number;
+}
+
 class CsvWriter {
   private stream: fs.WriteStream;
   private closed = false;
+  private fd: number | null = null;
+  private writesSinceSync = 0;
+  private flushEvery: number;
 
-  constructor(private filePath: string, private columns: string[]) {
-    this.stream = fs.createWriteStream(filePath, { encoding: "utf-8" });
-    this.stream.write(`${this.columns.join(",")}\n`);
+  constructor(
+    private filePath: string,
+    private columns: string[],
+    options: CsvWriterOptions = {},
+  ) {
+    const append = options.append ?? false;
+    this.flushEvery = Math.max(1, options.flushEvery ?? 250);
+
+    const needHeader = !append || !fs.existsSync(filePath) || fs.statSync(filePath).size === 0;
+    this.stream = fs.createWriteStream(filePath, {
+      encoding: "utf-8",
+      flags: append ? "a" : "w",
+    });
+
+    this.stream.on("open", (fd) => {
+      this.fd = fd;
+      if (needHeader) {
+        this.stream.write(`${this.columns.join(",")}\n`);
+      }
+    });
+  }
+
+  private flushIfNeeded() {
+    if (this.fd !== null && this.writesSinceSync >= this.flushEvery) {
+      fs.fdatasyncSync(this.fd);
+      this.writesSinceSync = 0;
+    }
   }
 
   writeRow(record: Record<string, unknown>) {
@@ -291,11 +323,17 @@ class CsvWriter {
       .map((column) => formatCsvValue(record[column]))
       .join(",");
     this.stream.write(`${line}\n`);
+    this.writesSinceSync += 1;
+    this.flushIfNeeded();
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
+    if (this.fd !== null && this.writesSinceSync > 0) {
+      fs.fdatasyncSync(this.fd);
+      this.writesSinceSync = 0;
+    }
     await new Promise<void>((resolve, reject) => {
       const onError = (err: Error) => {
         cleanup();
@@ -323,7 +361,7 @@ class CsvWriter {
 class PostgisExporter {
   private writer: CsvWriter;
 
-  constructor(private outputPath: string) {
+  constructor(private outputPath: string, options: CsvWriterOptions = {}) {
     this.writer = new CsvWriter(outputPath, [
       "attendance_id",
       "patient_id",
@@ -351,7 +389,7 @@ class PostgisExporter {
       "motivo_alta",
       "entrada",
       "alta",
-    ]);
+    ], options);
   }
 
   write(patient: CleanedPatient, attendances: CleanedAttendance[]) {
@@ -688,26 +726,58 @@ async function streamRecords(
 }
 
 // ==============================
-// ✍️ Escrita em STREAM (arrays JSON)
+// ✍️ Escrita em STREAM (NDJSON)
 // ==============================
-class JsonArrayWriter {
-  private first = true;
-  private stream: fs.WriteStream;
+interface NdjsonWriterOptions {
+  append?: boolean;
+  flushEvery?: number;
+}
 
-  constructor(private filePath: string) {
-    this.stream = fs.createWriteStream(filePath, { encoding: "utf-8" });
-    this.stream.write("[");
+class NdjsonWriter {
+  private stream: fs.WriteStream;
+  private fd: number | null = null;
+  private flushEvery: number;
+  private writesSinceSync = 0;
+  private closed = false;
+
+  constructor(private filePath: string, options: NdjsonWriterOptions = {}) {
+    const append = options.append ?? false;
+    this.flushEvery = Math.max(1, options.flushEvery ?? 200);
+
+    this.stream = fs.createWriteStream(filePath, {
+      encoding: "utf-8",
+      flags: append ? "a" : "w",
+    });
+    this.stream.on("open", (fd) => {
+      this.fd = fd;
+    });
+  }
+
+  private flushIfNeeded() {
+    if (this.fd !== null && this.writesSinceSync >= this.flushEvery) {
+      fs.fdatasyncSync(this.fd);
+      this.writesSinceSync = 0;
+    }
   }
 
   write(obj: any) {
+    if (this.closed) {
+      throw new Error("NdjsonWriter: tentativa de escrita após fechamento");
+    }
     const json = typeof obj === "string" ? obj : JSON.stringify(obj);
-    if (!this.first) this.stream.write(",\n");
-    else this.first = false;
-    this.stream.write(json);
+    this.stream.write(`${json}\n`);
+    this.writesSinceSync += 1;
+    this.flushIfNeeded();
   }
 
   async close() {
-    return new Promise<void>((resolve, reject) => {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.fd !== null && this.writesSinceSync > 0) {
+      fs.fdatasyncSync(this.fd);
+      this.writesSinceSync = 0;
+    }
+    await new Promise<void>((resolve, reject) => {
       const onError = (err: any) => {
         cleanup();
         reject(err);
@@ -722,8 +792,44 @@ class JsonArrayWriter {
       };
       this.stream.on("error", onError);
       this.stream.on("finish", onFinish);
-      this.stream.end("]\n");
+      this.stream.end();
     });
+  }
+}
+
+// ==============================
+// 💾 Checkpoint simples para retomada
+// ==============================
+interface Stage1Checkpoint {
+  processed: number;
+  success: number;
+  failed: number;
+  updatedAt: string;
+  completed?: boolean;
+}
+
+class CheckpointManager {
+  constructor(private filePath: string) {}
+
+  async load(): Promise<Stage1Checkpoint | null> {
+    try {
+      const data = await fsp.readFile(this.filePath, "utf-8");
+      return parseCustomJSON<Stage1Checkpoint>(data);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  async save(data: Stage1Checkpoint) {
+    const tmpPath = `${this.filePath}.tmp`;
+    const payload = JSON.stringify({ ...data, updatedAt: new Date().toISOString() }, null, 2);
+    await fsp.writeFile(tmpPath, payload, "utf-8");
+    await fsp.rename(tmpPath, this.filePath);
+  }
+
+  async clear() {
+    await fsp.rm(this.filePath, { force: true });
   }
 }
 
@@ -756,20 +862,77 @@ class ETLProcessor {
   async processData(): Promise<void> {
     await this.ensureOutputDir();
 
-    const patientsPath = path.join(this.outputDir, "patients.json");
-    const attendancesPath = path.join(this.outputDir, "attendances.json");
-    const patientsWriter = new JsonArrayWriter(patientsPath);
-    const attendancesWriter = new JsonArrayWriter(attendancesPath);
+    const patientsPath = path.join(this.outputDir, "patients.ndjson");
+    const attendancesPath = path.join(this.outputDir, "attendances.ndjson");
     const postgisPath = path.join(this.outputDir, "postgis_ready.csv");
-    const postgisExporter = new PostgisExporter(postgisPath);
+    const checkpointPath = path.join(this.outputDir, "stage1.checkpoint.json");
+    const checkpointManager = new CheckpointManager(checkpointPath);
+
+    const existingCheckpoint = await checkpointManager.load();
+    const checkpointIsValid =
+      !!existingCheckpoint &&
+      !existingCheckpoint.completed &&
+      existingCheckpoint.processed > 0 &&
+      fs.existsSync(patientsPath) &&
+      fs.existsSync(attendancesPath) &&
+      fs.existsSync(postgisPath);
+
+    let resumeFrom = checkpointIsValid && existingCheckpoint ? existingCheckpoint.processed : 0;
+    let success = checkpointIsValid && existingCheckpoint ? existingCheckpoint.success : 0;
+    let failed = checkpointIsValid && existingCheckpoint ? existingCheckpoint.failed : 0;
+
+    if (checkpointIsValid && existingCheckpoint) {
+      this.logger.info(
+        `Checkpoint encontrado (${resumeFrom} registros concluídos). Retomando a partir do registro ${resumeFrom + 1}.`,
+      );
+    } else {
+      resumeFrom = 0;
+      success = 0;
+      failed = 0;
+      await checkpointManager.clear();
+      await Promise.all([
+        fsp.rm(patientsPath, { force: true }).catch(() => undefined),
+        fsp.rm(attendancesPath, { force: true }).catch(() => undefined),
+        fsp.rm(postgisPath, { force: true }).catch(() => undefined),
+      ]);
+    }
+
+    const appendMode = resumeFrom > 0;
+    const patientsWriter = new NdjsonWriter(patientsPath, { append: appendMode });
+    const attendancesWriter = new NdjsonWriter(attendancesPath, { append: appendMode });
+    const postgisExporter = new PostgisExporter(postgisPath, {
+      append: appendMode,
+      flushEvery: 200,
+    });
 
     this.logger.info(`Iniciando ETL com entrada: ${this.inputPath}`);
 
-    let success = 0;
-    let failed = 0;
     let seen = 0;
+    let processedRecords = resumeFrom;
+    const checkpointInterval = 200;
+
+    const persistCheckpoint = async (completed = false) => {
+      try {
+        await checkpointManager.save({
+          processed: processedRecords,
+          success,
+          failed,
+          completed,
+          updatedAt: new Date().toISOString(),
+        });
+      } catch (err) {
+        this.logger.error("Não foi possível salvar o checkpoint do Stage 1", err);
+      }
+    };
 
     const onRecord = async (jsonChunk: string) => {
+      seen += 1;
+      if (seen <= resumeFrom) {
+        return;
+      }
+
+      processedRecords += 1;
+
       // parse tolerante
       let row: RawPatientData;
       try {
@@ -777,6 +940,9 @@ class ETLProcessor {
       } catch (e) {
         failed++;
         if (failed <= 5) this.logger.warn(`Registro ignorado (erro de parse).`);
+        if (processedRecords % checkpointInterval === 0) {
+          await persistCheckpoint();
+        }
         return;
       }
 
@@ -789,15 +955,20 @@ class ETLProcessor {
         postgisExporter.write(patient, attendances);
 
         success++;
-        seen++;
 
         // log por registros (além do progresso por bytes)
-        if (seen % 100 === 0) {
-          this.logger.progress(`Registros processados: ${seen} (sucesso: ${success} | falhas: ${failed})`);
+        if (processedRecords % 100 === 0) {
+          this.logger.progress(
+            `Registros processados: ${processedRecords} (sucesso: ${success} | falhas: ${failed})`,
+          );
         }
       } catch (e) {
         failed++;
-        this.logger.error(`Erro ao transformar registro #${seen + 1}`, e);
+        this.logger.error(`Erro ao transformar registro #${processedRecords}`, e);
+      }
+
+      if (processedRecords % checkpointInterval === 0) {
+        await persistCheckpoint();
       }
     };
 
@@ -810,14 +981,16 @@ class ETLProcessor {
       failedChunks = result.failedChunks;
     } finally {
       await Promise.all([
-        patientsWriter.close().catch((err) => this.logger.error("Erro ao fechar patients.json", err)),
-        attendancesWriter.close().catch((err) => this.logger.error("Erro ao fechar attendances.json", err)),
+        patientsWriter.close().catch((err) => this.logger.error("Erro ao fechar patients.ndjson", err)),
+        attendancesWriter.close().catch((err) => this.logger.error("Erro ao fechar attendances.ndjson", err)),
         postgisExporter.close().catch((err) => this.logger.error("Erro ao fechar CSV PostGIS", err)),
       ]);
     }
 
     const total = totalChunks;
     failed += failedChunks;
+
+    await persistCheckpoint(true);
 
     this.logger.success(
       `Salvo em streaming: ${patientsPath}, ${attendancesPath} e ${postgisPath}`,
@@ -923,7 +1096,7 @@ async function main() {
   }
 
   if (runStage2) {
-    const defaultPatientsPath = path.join(resolvedOutput, "patients.json");
+    const defaultPatientsPath = path.join(resolvedOutput, "patients.ndjson");
     const patientsPath = patientsPathOverride ?? (isStage2Only && inputPath ? inputPath : defaultPatientsPath);
     await consolidateAddresses(patientsPath, resolvedOutput, defaults);
   }

@@ -22,12 +22,14 @@ O pipeline pode ser executado em duas fases distintas:
    npx ts-node script.ts stage1 ./TABLE_EXPORT_DATA.json ./output
    ```
 
-   Gera `patients.json`, `attendances.json` e `postgis_ready.csv`, consolidados para importação no PostGIS.
+   Gera `patients.ndjson`, `attendances.ndjson` e `postgis_ready.csv`, consolidados para importação no PostGIS.
+   A etapa mantém um arquivo `stage1.checkpoint.json` com o número de registros concluídos e retoma automaticamente em caso de
+   interrupções, reaproveitando os arquivos já gravados.
 
 2. **Stage 2 – Consolidação de endereços e coordenadas**
 
    ```bash
-   npx ts-node script.ts stage2 ./output/patients.json ./output
+   npx ts-node script.ts stage2 ./output/patients.ndjson ./output
    ```
 
    Deduplica endereços, agrega número de ocorrências e consolida latitude/longitude (quando disponível), podendo acionar geocodificação com `--geocode`.
@@ -38,7 +40,7 @@ Para executar as duas etapas em sequência basta omitir o subcomando:
 npx ts-node script.ts ./TABLE_EXPORT_DATA.json ./output --geocode
 ```
 
-Opcionalmente utilize `--patients=/caminho/personalizado.json` para informar uma origem específica dos dados de pacientes na segunda etapa.
+Opcionalmente utilize `--patients=/caminho/personalizado.ndjson` para informar uma origem específica dos dados de pacientes na segunda etapa.
 
 ## Perguntas Focadas na Distribuição e Demografia Espacial
 
