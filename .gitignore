@@ -15,6 +15,9 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Token usage tracking
+token-usage.json
+
 # Environment variables
 .env
 .env.local
