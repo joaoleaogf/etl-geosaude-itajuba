@@ -6,7 +6,8 @@ Pipeline de **ETL (Extração, Transformação e Carga)** desenvolvido para o pr
 O sistema realiza:
 
 * Limpeza e padronização de dados brutos (endereços, CIDs, convênios, etc.);
-* **Geocodificação** dos endereços dos pacientes e cruzamento com setores censitários do IBGE;
+* **Geocodificação resiliente** dos endereços (com fallback entre provedores e tratamento seguro de respostas 404);
+* Cruzamento com setores censitários do IBGE;
 * Conversão dos resultados para formatos geoespaciais compatíveis com o  **PostGIS** ;
 * Geração de logs detalhados de execução e registro de falhas para auditoria.
 
@@ -25,6 +26,7 @@ O pipeline pode ser executado em duas fases distintas:
    Gera `patients.ndjson`, `attendances.ndjson` e `postgis_ready.csv`, consolidados para importação no PostGIS.
    A etapa mantém um arquivo `stage1.checkpoint.json` com o número de registros concluídos e retoma automaticamente em caso de
    interrupções, reaproveitando os arquivos já gravados.
+   O `patients.ndjson` passa a incluir a lista de atendimentos normalizados dentro de cada paciente.
 
 2. **Stage 2 – Consolidação de endereços e coordenadas**
 
@@ -41,6 +43,19 @@ npx ts-node script.ts ./TABLE_EXPORT_DATA.json ./output --geocode
 ```
 
 Opcionalmente utilize `--patients=/caminho/personalizado.ndjson` para informar uma origem específica dos dados de pacientes na segunda etapa.
+
+### Importação no PostGIS
+
+1. Copie `postgis_ready.csv` e `output/import.sql` para o servidor com PostGIS.
+2. Em um terminal com `psql`, defina o caminho do CSV e execute o script:
+
+   ```psql
+   \set csv_file '/caminho/absoluto/para/postgis_ready.csv'
+   \i output/import.sql
+   ```
+
+   O script cria a tabela `attendances_geocoded`, remove estruturas antigas e prepara índices espaciais.
+   A instrução `\copy` está comentada para permitir ajustes; basta descomentar (caso necessário) e garantir que o caminho esteja correto.
 
 ## Perguntas Focadas na Distribuição e Demografia Espacial
 
