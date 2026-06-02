@@ -1,123 +1,136 @@
-# Padrões Espaciais da Saúde Itajubá
+# ETL GeoSaúde Itajubá
 
+> Pipeline de ETL em TypeScript que limpa, geocodifica e prepara dados hospitalares para análise espacial em **PostGIS** e **QGIS** — base do projeto *Padrões Espaciais da Saúde Itajubá-MG*.
 
-Pipeline de **ETL (Extração, Transformação e Carga)** desenvolvido para o projeto  **Padrões Espaciais da Saúde Itajubá** , com foco em integrar e preparar dados hospitalares, demográficos e socioeconômicos para análises espaciais no **PostGIS** e  **QGIS** .
+![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178C6?logo=typescript&logoColor=white)
+![Node.js](https://img.shields.io/badge/Node.js-≥18-339933?logo=node.js&logoColor=white)
+![PostGIS](https://img.shields.io/badge/PostGIS-ready-336791?logo=postgresql&logoColor=white)
+![License: MIT](https://img.shields.io/badge/License-MIT-E0A458)
 
-O sistema realiza:
+---
 
-* Limpeza e padronização de dados brutos (endereços, CIDs, convênios, etc.);
-* **Geocodificação resiliente** dos endereços (com fallback entre provedores e tratamento seguro de respostas 404);
-* Cruzamento com setores censitários do IBGE;
-* Conversão dos resultados para formatos geoespaciais compatíveis com o  **PostGIS** ;
-* Geração de logs detalhados de execução e registro de falhas para auditoria.
+## 🔒 Privacidade dos dados (LGPD)
 
-O ETL serve como base para as análises de distribuição espacial de atendimentos, correlações demográficas e identificação de hotspots e coldspots de saúde pública no município de  **Itajubá-MG** .
+Este repositório contém **apenas o código** do pipeline. **Nenhum dado real de pacientes** (nomes, endereços, CIDs, prontuários) é versionado aqui — esses dados são pessoais sensíveis (LGPD, Art. 5º, II) e ficam fora do controle de versão (veja o [`.gitignore`](.gitignore)).
 
-## Execução do ETL em duas etapas
+Para rodar o ETL, forneça seu próprio arquivo de entrada no formato esperado (veja [Formato de entrada](#formato-de-entrada)).
 
-O pipeline pode ser executado em duas fases distintas:
+---
 
-1. **Stage 1 – Normalização e arquivos para PostGIS**
+## Visão geral
 
-   ```bash
-   npx ts-node script.ts stage1 ./TABLE_EXPORT_DATA.json ./output
-   ```
+O pipeline integra e padroniza dados hospitalares, demográficos e socioeconômicos para análises de distribuição espacial de atendimentos em Itajubá-MG. Ele realiza:
 
-   Gera `patients.ndjson`, `attendances.ndjson` e `postgis_ready.csv`, consolidados para importação no PostGIS.
-   A etapa mantém um arquivo `stage1.checkpoint.json` com o número de registros concluídos e retoma automaticamente em caso de
-   interrupções, reaproveitando os arquivos já gravados.
-   O `patients.ndjson` passa a incluir a lista de atendimentos normalizados dentro de cada paciente.
+- **Limpeza e padronização** de dados brutos (endereços, CIDs, convênios, faixas etárias);
+- **Geocodificação resiliente** dos endereços, com *fallback* entre provedores (LocationIQ, Geoapify, OpenCage, Nominatim) e tratamento seguro de respostas 404;
+- **Deduplicação de endereços** e consolidação de latitude/longitude;
+- **Conversão** dos resultados para formatos compatíveis com **PostGIS**;
+- **Checkpoints e logs** detalhados para retomada e auditoria.
 
-2. **Stage 2 – Consolidação de endereços e coordenadas**
+A saída serve de base para identificar *hotspots*/*coldspots* de saúde pública, correlações demográficas (dados IBGE) e desigualdades de acesso.
 
-   ```bash
-   npx ts-node script.ts stage2 ./output/patients.ndjson ./output
-   ```
+## Arquitetura do pipeline
 
-   Deduplica endereços, agrega número de ocorrências e consolida latitude/longitude (quando disponível), podendo acionar geocodificação com `--geocode`.
-
-Para executar as duas etapas em sequência basta omitir o subcomando:
-
-```bash
-npx ts-node script.ts ./TABLE_EXPORT_DATA.json ./output --geocode
+```
+entrada (JSON export)
+        │
+        ▼
+┌─────────────────────────────┐
+│ Stage 1 — Normalização      │  → patients.ndjson
+│ limpeza, schema, checkpoint │    attendances.ndjson
+└─────────────────────────────┘    postgis_ready.csv
+        │
+        ▼
+┌─────────────────────────────┐
+│ Stage 2 — Endereços + Geo   │  → endereços deduplicados
+│ dedup, geocodificação       │    com lat/long
+└─────────────────────────────┘
+        │
+        ▼
+   import.sql → PostGIS (attendances_geocoded) → QGIS
 ```
 
-Opcionalmente utilize `--patients=/caminho/personalizado.ndjson` para informar uma origem específica dos dados de pacientes na segunda etapa.
+| Arquivo | Responsabilidade |
+|---|---|
+| `script.ts` | Orquestra os stages, CLI e schema de saída |
+| `geocoding.ts` | Geocodificação com fallback entre provedores |
+| `tokenManager.ts` | Rotação/uso de tokens de API por provedor |
+| `jsonParser.ts` | Parsing resiliente do export JSON de entrada |
+| `utils.ts` | Normalização de endereços, datas e campos |
+
+## Stack
+
+`TypeScript` · `Node.js` · `ts-node` · `axios` · `PostGIS` · `QGIS` · APIs de geocodificação
+
+## Como rodar
+
+```bash
+# 1. Instale as dependências
+npm install
+
+# 2. Execute as duas etapas em sequência
+npx ts-node script.ts ./seu_export.json ./output --geocode
+```
+
+Ou rode os estágios separadamente:
+
+```bash
+# Stage 1 — normalização e arquivos para PostGIS
+npx ts-node script.ts stage1 ./seu_export.json ./output
+
+# Stage 2 — consolidação de endereços e coordenadas
+npx ts-node script.ts stage2 ./output/patients.ndjson ./output --geocode
+```
+
+O Stage 1 mantém `stage1.checkpoint.json` e **retoma automaticamente** após interrupções, reaproveitando os arquivos já gravados. Use `--patients=/caminho/custom.ndjson` para informar uma origem específica no Stage 2.
+
+### Variáveis de ambiente
+
+| Variável | Descrição |
+|---|---|
+| `GEOCODER_USER_AGENT` | User-Agent enviado aos provedores de geocodificação |
+| `GEOCODER_ENABLE_NOMINATIM` | `true` para habilitar o Nominatim como provedor |
+
+As chaves de API dos provedores são lidas de um arquivo local de tokens, **não versionado**.
+
+### Formato de entrada
+
+O pipeline espera um export JSON de atendimentos com, entre outros, os campos:
+`nr_atendimento`, `dt_entrada`, `ds_convenio`, `ds_setor_atendimento`, `nm_paciente`,
+`dt_nascimento`, `ie_sexo`, `ds_endereco`, `cd_cep`, `ds_bairro`, `cd_cid_principal`, `ds_motivo_alta`.
+
+> ⚠️ Use sempre dados anonimizados/autorizados. Nunca faça commit de dados reais de pacientes.
 
 ### Importação no PostGIS
 
-1. Copie `postgis_ready.csv` e `output/import.sql` para o servidor com PostGIS.
-2. Em um terminal com `psql`, defina o caminho do CSV e execute o script:
+```psql
+\set csv_file '/caminho/absoluto/para/postgis_ready.csv'
+\i output/import.sql
+```
 
-   ```psql
-   \set csv_file '/caminho/absoluto/para/postgis_ready.csv'
-   \i output/import.sql
-   ```
+O script cria a tabela `attendances_geocoded`, remove estruturas antigas e prepara índices espaciais. A instrução `\copy` vem comentada para permitir ajustes de caminho.
 
-   O script cria a tabela `attendances_geocoded`, remove estruturas antigas e prepara índices espaciais.
-   A instrução `\copy` está comentada para permitir ajustes; basta descomentar (caso necessário) e garantir que o caminho esteja correto.
+## Perguntas de pesquisa
 
-## Perguntas Focadas na Distribuição e Demografia Espacial
+O ETL alimenta análises espaciais que respondem, entre outras:
 
-1. **Qual é o padrão de distribuição espacial (hotspots e coldspots) da frequência total de atendimentos hospitalares em Itajubá?**
+- Padrões de *hotspots*/*coldspots* da frequência de atendimentos;
+- Correlação entre densidade demográfica (IBGE) e taxa de atendimentos;
+- Relação entre distribuição espacial e variáveis socioeconômicas (grau de instrução, estado civil);
+- Padrões por faixa etária, tipo de convênio (SUS × particular), nível de urgência e diagnósticos (CID);
+- Diferenças espaciais por motivo de alta (alta, transferência, óbito).
 
-   * A análise se baseia na geolocalização dos pacientes (endereço, CEP, bairro) e visa avaliar como essa distribuição se manifesta nos setores censitários ou bairros.
-2. **Existe uma correlação espacial entre a densidade demográfica (dados IBGE) e a taxa de atendimentos hospitalares em diferentes setores censitários?**
+A lista completa está em [`# Perguntas de Pesquisa Exploratórias.md`](./%23%20Perguntas%20de%20Pesquisa%20Explorat%C3%B3rias.md).
 
-   * Esta questão utiliza os dados do IBGE (densidade demográfica e indicadores por setor censitário) em conjunto com a frequência dos atendimentos.
-3. **Como a distribuição espacial dos atendimentos se relaciona com características socioeconômicas dos pacientes, como o grau de instrução ou estado civil?**
+## Equipe
 
-   * Esta questão mapearia espacialmente variáveis demográficas como o grau de instrução (`ie_grau_instrucao`) e o estado civil para identificar se há concentrações geográficas de grupos específicos de pacientes.
-4. **As faixas etárias mais vulneráveis (crianças, idosos – `nr_anos`) apresentam um padrão espacial de atendimento diferente em comparação com a população adulta?**
+Projeto acadêmico colaborativo:
 
-   * A idade do paciente (`nr_anos` ou `dt_nascimento`) pode ser mapeada espacialmente para verificar se setores censitários específicos têm uma proporção maior de atendimentos em grupos etários específicos.
+- **João Leão** — ETL, limpeza e geocodificação dos dados (este repositório)
+- **Juliana** — carga no PostGIS (atendimentos + IBGE)
+- **Hiara** — projeto QGIS (camadas de Itajubá, setores censitários, ruas)
+- **Elisa** — escolha de técnicas e indicadores por questão de pesquisa
 
----
+## Licença
 
-## Perguntas Focadas no Tipo de Atendimento e Necessidade Clínica
-
-5. **A distribuição espacial dos atendimentos difere significativamente entre os tipos de convênio (`ds_convenio`) utilizados (ex.: SUS versus Particular/Unimed)?**
-
-   * É possível mapear a residência dos pacientes em função do seu convênio de saúde para entender se o uso do SUS ou planos particulares possui concentrações geográficas distintas.
-6. **Quais são as áreas geográficas que concentram o maior número de atendimentos de urgência e emergência (`ds_nivel_urgencia`)?**
-
-   * Esta análise exploraria se há disparidades espaciais na necessidade de cuidados críticos, mapeando o nível de urgência (como *Emergência* ou *Muito Urgente*) por setores censitários.
-   * (Distribuição de ambulâncias)
-7. **Existe uma concentração espacial de pacientes que buscaram atendimento em setores especializados, como Ortopedia ou Tomografia Computadorizada (`ds_setor_atendimento`)?**
-
-   * Esta questão cruza a localização dos pacientes com o setor de atendimento para identificar se o acesso a determinadas especialidades ou exames diagnósticos é geograficamente desigual.
-8. **Há padrões espaciais identificáveis para os principais diagnósticos/motivos de internação (`cd_cid_principal`) ou procedimentos (`ds_proc_principal`) realizados?**
-
-   * Ao mapear as causas principais de atendimento (como *R51, J189, S934, M94* — exemplos de códigos CID) e os procedimentos, pode-se identificar *clusters* de doenças ou traumas específicos em certas regiões de Itajubá.
-9. **Como a distribuição espacial de atendimentos por doenças específicas pode ser comparada com os dados de vacinação (Vacinação) no mesmo espaço geográfico?**
-
-   * Esta é uma questão importante, pois o projeto prevê a inclusão de dados de vacinação, permitindo a correlação espacial entre a imunização de uma área e a incidência de doenças tratadas no hospital.
-
----
-
-## Perguntas Focadas na Saída e Resultado
-
-10. **A distribuição espacial dos pacientes que receberam “Alta do Pronto Socorro” difere daquelas que resultaram em “Transferido para outro estabelecimento” ou “Óbito” (`ds_motivo_alta`)?**
-
-    * Mapear o motivo da alta pode ajudar a entender se determinadas áreas geográficas apresentam piores resultados de saúde ou se são fontes de pacientes que necessitam de transferência para centros mais especializados.
-
----
-
-## Etapas do Projeto
-
-1. **Fazer o código para limpar os dados. (João)**
-   a. Fazer a geocodificação dos endereços.
-   b. Criar um *Schema* do banco.
-   c. Saída: Arquivos no formato aceito pelo **PostGIS**.
-2. **Carregar os dados no PostGIS. (Juliana)**
-   a. Carregar dados de atendimento.
-   b. Carregar dados do IBGE.
-3. **Criar Projeto no QGIS contendo. (Hiara)**
-   a. Criar camadas de dados de Itajubá (ShapeFile Cidade, Setores Censitários e ruas).
-   b. Criar camada de dados do IBGE.
-   c. Criar camada de dados de atendimentos.
-   d. Procurar ShapeFile de ruas.
-4. **Avaliar quais técnicas são adequadas para responder a cada questão levantada. (Elisa)**
-   a. Criar indicadores.
-
----
+[MIT](LICENSE) © João Leão
