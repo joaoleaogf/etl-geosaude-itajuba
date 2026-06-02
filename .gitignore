@@ -18,6 +18,15 @@ lerna-debug.log*
 # Token usage tracking
 token-usage.json
 
+# Dados sensíveis (LGPD) — nunca versionar dados de pacientes
+TABLE_EXPORT_DATA.json
+atendimentos_*.csv
+/output/
+/out/
+*.ndjson
+*.csv
+*.sql
+
 # Environment variables
 .env
 .env.local
